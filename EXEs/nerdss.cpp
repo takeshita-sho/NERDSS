@@ -983,8 +983,8 @@ int main(int argc, char *argv[]) {
     // Pre-compute random displacements on GPU for non-reacting complexes.
     // Complexes that end up reacting will have their coordinates overwritten
     // by the association logic, so the pre-computed vectors are harmless.
-    // After downloading, mark all molecules as canBeResampled so that the
-    // individual CPU create_complex_propagation_vectors calls are skipped.
+    // After downloading, apply CPU-side boundary reflection (which the GPU
+    // does not perform), then mark molecules as canBeResampled.
     if (useGPU) {
       gpuManager.resizeIfNeeded(
           static_cast<int>(complexList.size()),
@@ -994,11 +994,48 @@ int main(int argc, char *argv[]) {
       gpuManager.launchPropagationKernel();
       gpuManager.downloadPropagationResults(complexList);
 
+      // Apply boundary reflection on the CPU for each complex, matching
+      // what create_complex_propagation_vectors does after generating
+      // the random vectors. Without this, molecules can drift through
+      // boundaries and fail to react.
+      for (int comIdx = 0; comIdx < static_cast<int>(complexList.size()); ++comIdx) {
+        if (complexList[comIdx].isEmpty) continue;
+        if (complexList[comIdx].memberList.empty()) continue;
+
+        // On-sphere-surface complexes use a special propagation path
+        // that is not handled by the GPU kernel; skip and let CPU handle.
+        if (complexList[comIdx].OnSurface && membraneObject.isSphere) continue;
+
+        // Compute RS3Dinput (same logic as create_complex_propagation_vectors)
+        double RS3Dinput = 0.0;
+        if (membraneObject.implicitLipid) {
+          for (auto& molIndex : complexList[comIdx].memberList) {
+            for (int RS3Dindex = 0; RS3Dindex < 100; RS3Dindex++) {
+              if (std::abs(membraneObject.RS3Dvect[RS3Dindex + 400]
+                           - moleculeList[molIndex].molTypeIndex) < 1E-2) {
+                RS3Dinput = membraneObject.RS3Dvect[RS3Dindex + 300];
+                break;
+              }
+            }
+          }
+        }
+
+        int firstMolType = moleculeList[complexList[comIdx].memberList[0]].molTypeIndex;
+        bool isInsideCompartment = molTemplateList[firstMolType].insideCompartment;
+
+        // Apply boundary reflection to the GPU-generated propagation vectors
+        reflect_traj_complex_rad_rot(params, moleculeList, complexList[comIdx],
+                                     membraneObject, RS3Dinput, isInsideCompartment);
+      }
+
       // Mark all active molecules so CPU propagation calls are skipped.
-      // The vectors are already in complexList[].trajTrans/trajRot.
-      // Boundary reflection will still be applied during the overlap phase.
+      // The vectors are now in complexList[].trajTrans/trajRot with proper
+      // boundary reflection applied.
       for (auto &mol : moleculeList) {
         if (mol.isEmpty || mol.isImplicitLipid) continue;
+        // Skip sphere-surface complexes (let CPU handle them fully)
+        if (membraneObject.isSphere &&
+            complexList[mol.myComIndex].OnSurface) continue;
         if (mol.trajStatus == TrajStatus::none) {
           mol.trajStatus = TrajStatus::canBeResampled;
         }

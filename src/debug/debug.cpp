@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "classes/mpi_functions.hpp"
 #include "error/error.hpp"
 #include "macro.hpp"
 
